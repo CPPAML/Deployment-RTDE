@@ -1,0 +1,6 @@
+evdev==1.9.2
+matplotlib==3.10.6
+mkl-service==2.5.2
+PyQt6==6.9.1
+setuptools==80.9.0
+wheel==0.45.1
