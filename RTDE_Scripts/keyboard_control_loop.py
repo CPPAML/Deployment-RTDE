@@ -30,7 +30,7 @@ WRIST2_LIMIT = 0.10  # rad (~6°)
 TILT_STEP = 0.07     # rad added when too close
 MIN_SEG = 0.002      # m, smaller segments near singularity
 # Home pose (x(m), y(m), z(m), xq(rads), yq(rads), zq(rads))
-HOME_POSE = [-0.14397, -0.43562, 0.20203, 0.001, -3.116, -0.040]
+HOME_POSE = [-0.3712, -0.49439, 0.58105, .658, -2.489, 1.598]
 # ----------------------------------------------
 
 logging.getLogger().setLevel(logging.INFO)
@@ -39,8 +39,10 @@ def setp_to_list(sp):
     return [getattr(sp, f"input_double_register_{i}") for i in range(6)]
 
 def list_to_setp(sp, lst):
+    # Send with fixed precision to avoid micro-moves due to floating noise
     for i in range(6):
-        setattr(sp, f"input_double_register_{i}", float(lst[i]))
+        val = float(lst[i])
+        setattr(sp, f"input_double_register_{i}", round(val, 5))
     return sp
 
 def clamp_pose(p):
@@ -108,31 +110,55 @@ def run_control_loop(io, interactive=False):
         con.disconnect()
         raise SystemExit("RTDE send_start() failed – is the URP program playing?")
 
-    # ---- Initialize desired pose in METERS/RADIANS ----
-    # Prefer the live robot pose (already meters/radians) to avoid frame/unit mismatches.
-    desired = None
-    if "actual_TCP_pose" in state_names:
-        # Wait briefly for the first state packet
-        for _ in range(100):  # ~2 seconds at 50 Hz
-            s = con.receive()
-            if s is not None and hasattr(s, "actual_TCP_pose") and s.actual_TCP_pose:
-                desired = list(s.actual_TCP_pose)
-                break
-
-    if desired is None:
-        # Fallback to configured HOME pose (meters, radians)
-        desired = list(HOME_POSE)
-
+    # ---- Initialize desired pose at HOME in METERS/RADIANS ----
+    desired = list(HOME_POSE)
     list_to_setp(setp, desired)
-    for i in range(6):
-        setattr(setp, f"input_double_register_{i}", desired[i])
     watchdog.input_int_register_0 = 0
+
+    # Pre-send initial HOME setpoint once the URP loop reports ready
+    initial_sent = False
+    initial_confirmed = False
+    deadline_ready = time.time() + 2.0  # wait up to ~2s for ready
+    while time.time() < deadline_ready:
+        s = con.receive()
+        if s is None:
+            time.sleep(0.02)
+            continue
+        if getattr(s, "output_int_register_0", 1) == 1:
+            # Send HOME setpoint and hold watchdog high while waiting for confirmation
+            list_to_setp(setp, desired)
+            con.send(setp)
+            watchdog.input_int_register_0 = 1
+            con.send(watchdog)
+            initial_sent = True
+            deadline_confirm = time.time() + 5.0  # allow up to 5s to confirm
+            while time.time() < deadline_confirm:
+                s2 = con.receive()
+                if s2 is None:
+                    time.sleep(0.02)
+                    continue
+                if getattr(s2, "output_int_register_0", 1) == 0:
+                    initial_confirmed = True
+                    break
+                # keep watchdog asserted while moving
+                con.send(watchdog)
+                time.sleep(0.02)
+            break
+        # keep watchdog ticking low until ready
+        con.send(watchdog)
+        time.sleep(0.02)
+    # Drop watchdog before entering main loop
+    watchdog.input_int_register_0 = 0
+    try:
+        con.send(watchdog)
+    except Exception:
+        pass
     # ---------------------------------------------------
 
     base_pos_step = POS_STEP_DEFAULT
     base_rot_step = ROT_STEP_DEFAULT
-    pending_send = True           # send initial pose
-    move_completed = True
+    pending_send = not initial_sent           # if we already sent HOME, don't resend immediately
+    move_completed = not initial_sent  # False if initial HOME was sent to track completion
     last_send_time = 0.0
     send_rate_limit = 0.02        # at most 50 Hz setpoint updates
     sync_request = False          # when True, sync commanded pose to current TCP
@@ -305,7 +331,7 @@ def run_control_loop(io, interactive=False):
             lines = []
             if interactive:
                 lines.append(info)
-            lines.append(f"Target pose [x y z rx ry rz] (m, rad): {['%.4f'%v for v in desired]}")
+            lines.append(f"Target pose [x y z rx ry rz] (m, rad): {['%.5f'%v for v in desired]}")
             lines.append(f"base_pos_step={base_pos_step:.4f} m | base_rot_step={base_rot_step:.3f} rad | eff_pos_step={pos_step_eff:.4f} m | eff_rot_step={rot_step_eff:.3f} rad")
             if q5 is not None:
                 lines.append(f"q5={q5:.3f} rad | singularity_scale={scale:.2f}")
@@ -313,7 +339,7 @@ def run_control_loop(io, interactive=False):
                 lines.append(sing_info)
             lines.append(f"ready={int(ready)} | pending={int(pending_send)} | segments={len(segment_queue)}")
             if hasattr(state, "target_q"):
-                lines.append(f"target_q: {['%.4f'%v for v in state.target_q]}")
+                lines.append(f"target_q: {['%.5f'%v for v in state.target_q]}")
             io.write_lines(lines)
 
             # Pace
@@ -367,9 +393,22 @@ class PrintIO:
     def write_lines(self, lines):
         now = time.time()
         if now - self._last >= (1.0/PRINT_HZ - 1e-6):
-            print("-----")
+            # Clear the screen so we redraw in place instead of appending lines
+            try:
+                if os.name == "nt":
+                    # Works in cmd and PowerShell
+                    os.system("cls")
+                else:
+                    # ANSI clear screen and cursor home
+                    sys.stdout.write("\033[2J\033[H")
+            except Exception:
+                pass
             for line in lines:
                 print(line)
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
             self._last = now
 
     def sleep(self, sec):
@@ -379,18 +418,29 @@ class PrintIO:
         return True
 
 def terminal_available():
-    # A terminal is considered available if stdout is a TTY and TERM is set to a known type
-    if not sys.stdout.isatty():
+    # Consider terminal available if a TTY is attached. On Windows, TERM may be unset.
+    if os.name == "nt":
+        return bool(sys.stdout.isatty() or sys.stdin.isatty())
+    # POSIX: require TTY and a sane TERM
+    if not (sys.stdout.isatty() or sys.stdin.isatty()):
         return False
     term = os.environ.get("TERM", "")
     return bool(term) and term.lower() not in ("unknown", "dumb")
 
 def main():
-    if HAS_CURSES and terminal_available():
+    term_ok = terminal_available()
+    if term_ok and HAS_CURSES:
         curses.wrapper(lambda stdscr: run_control_loop(CursesIO(stdscr), interactive=True))
     else:
-        print("No interactive terminal detected; running in non-curses mode.")
-        print("Tip: run in a real terminal to use keyboard controls.")
+        if term_ok and not HAS_CURSES:
+            print("Terminal detected, but curses module is unavailable; running in non-interactive mode.")
+            if os.name == "nt":
+                print("Tip (Windows): pip install windows-curses and run from a real terminal to enable keyboard controls.")
+            else:
+                print("Tip: ensure TERM is set and curses is available to enable keyboard controls.")
+        else:
+            print("No TTY detected; running in non-interactive print mode.")
+            print("Tip: open a terminal (e.g., PyCharm Terminal tab, cmd/PowerShell) to use keyboard controls.")
         run_control_loop(PrintIO(), interactive=False)
 
 if __name__ == "__main__":

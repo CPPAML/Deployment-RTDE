@@ -68,8 +68,7 @@ docker run --name $CONTAINER_NAME `
   $IMAGE | Out-Null
 
 # --- Resolve the active Programs directory inside the container ---
-# We execute a small shell script in the container to choose the correct path.
-$PROGRAMS_DIR = docker exec $CONTAINER_NAME sh -lc @'
+$script = @'
 set -e
 for d in /ursim/programs.UR5 /ursim/programs.UR5e; do
   [ -d "$d" ] && { echo "$d"; exit 0; }
@@ -79,10 +78,15 @@ if [ -e /ursim/programs ]; then
   [ -n "$t" ] && [ -d "$t" ] && { echo "$t"; exit 0; }
 fi
 echo /ursim/programs
-'@
+'@ -replace "`r",""   # important on Windows
 
+# Use /bin/sh -c (no -l)
+$PROGRAMS_DIR = docker exec $CONTAINER_NAME /bin/sh -c "$script" 2>$null
 $PROGRAMS_DIR = $PROGRAMS_DIR.Trim()
-Log "Resolved Programs directory: $PROGRAMS_DIR"
+
+if (-not $PROGRAMS_DIR) {
+  throw "Could not resolve Programs directory inside the container. Try: docker logs $CONTAINER_NAME"
+}
 
 # --- Copy RTDE_Urp files into Programs ---
 Log "Creating $PROGRAMS_DIR (if missing) and copying files ..."
@@ -92,7 +96,7 @@ docker exec $CONTAINER_NAME sh -lc "cp -r '${MOUNT_POINT}/.' '${PROGRAMS_DIR}/'"
 # --- Confirm copy ---
 $COUNT = docker exec $CONTAINER_NAME sh -lc "ls -1A '$PROGRAMS_DIR' | wc -l || true"
 $COUNT = $COUNT.Trim()
-Log "Copy complete. Item(s) now in $PROGRAMS_DIR: $COUNT"
+Log ("Copy complete. Item(s) now in {0}: {1}" -f $PROGRAMS_DIR, $COUNT)
 
 # --- Helpful endpoints ---
 Log ("noVNC:  http://localhost:{0}/vnc.html?autoconnect=1&resize=scale&host=localhost&port={0}" -f $PORT_WEB)

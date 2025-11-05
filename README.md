@@ -13,6 +13,7 @@ If you follow the steps below, you should be able to set up the environment, run
 
 ## Contents
 - Prerequisites (per OS)
+- Install Docker via Command Line (Windows & Linux)
 - Quick Start (per OS)
 - Running URSim in Docker
 - Connecting to a real robot
@@ -44,6 +45,63 @@ macOS
 - Docker Desktop (for URSim).
 - Tablet backends provided here are Windows/Linux only; macOS can still run the RTDE scripts.
 
+
+## Install Docker via Command Line (Windows & Linux)
+
+Windows (PowerShell)
+1) Ensure WSL2 is installed and enabled (Windows 10/11):
+   ```powershell
+   wsl --install
+   # If prompted, restart Windows after installation
+   ```
+2) Install Docker Desktop via winget:
+   ```powershell
+   winget install -e --id Docker.DockerDesktop
+   ```
+3) Start Docker Desktop (first launch finalizes setup) and switch it to use Linux containers (default). Then verify:
+   ```powershell
+   Start-Process "$Env:ProgramFiles\Docker\Docker\Docker Desktop.exe"
+   docker --version
+   docker run --rm hello-world
+   ```
+   If `docker` isn’t recognized after install, log out/in or reboot once.
+
+Linux (Ubuntu/Debian)
+1) Remove older Docker packages (if any):
+   ```bash
+   sudo apt-get remove -y docker docker-engine docker.io containerd runc || true
+   ```
+2) Set up Docker’s official apt repository:
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y ca-certificates curl gnupg
+   sudo install -m 0755 -d /etc/apt/keyrings
+   curl -fsSL https://download.docker.com/linux/$(. /etc/os-release; echo "$ID")/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+   echo \
+     "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(. /etc/os-release; echo "$ID") \
+     $(. /etc/os-release; echo "$VERSION_CODENAME") stable" | \
+     sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+   sudo apt-get update
+   ```
+3) Install Docker Engine, CLI, and Compose plugin:
+   ```bash
+   sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+   ```
+4) (Recommended) Run Docker as non-root:
+   ```bash
+   sudo usermod -aG docker "$USER"
+   newgrp docker <<<'refresh groups in this shell'
+   ```
+5) Enable and verify:
+   ```bash
+   sudo systemctl enable --now docker
+   docker --version
+   docker run --rm hello-world
+   ```
+
+Note
+- URSim images are Linux-based; on Windows, ensure Docker Desktop is set to Linux containers.
+- On Linux, if `docker run hello-world` fails with permissions, log out/in to refresh group membership.
 
 ## Quick Start
 
