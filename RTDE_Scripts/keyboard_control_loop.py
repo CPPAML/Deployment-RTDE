@@ -327,6 +327,8 @@ def run_control_loop(io, interactive=False):
                 move_completed = True
                 watchdog.input_int_register_0 = 0
 
+            # z = 150/100
+
             # Output
             lines = []
             if interactive:

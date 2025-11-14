@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 # ---- choose backend by platform ----
 if sys.platform.startswith("win"):
     try:
-        from wintab_wrapper import Tablet as _WinTabTablet  # <-- your file exposing Tablet
+        from .wintab_wrapper import Tablet as _WinTabTablet  # <-- your file exposing Tablet
     except ImportError as e:
         raise ImportError(
             "Couldn't import wintab_wrapper.Tablet. "
@@ -46,7 +46,7 @@ if sys.platform.startswith("win"):
 
 elif sys.platform.startswith("linux"):
     try:
-        from linux_wacom_evdev import WacomTabletReader as _EvdevTablet
+        from .linux_wacom_evdev import WacomTabletReader as _EvdevTablet
     except ImportError as e:
         raise ImportError(
             "Couldn't import linux_wacom_evdev.WacomTabletReader. "
