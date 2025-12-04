@@ -20,7 +20,7 @@ class WacomTabletReader:
       try:
           while True:
               x, y, p = reader.read()  # latest values (floats if normalize=True)
-              # ... send to your robot here ...
+              # ... send to the robot here ...
               time.sleep(0.01)  # 100 Hz loop
       finally:
           reader.stop()
