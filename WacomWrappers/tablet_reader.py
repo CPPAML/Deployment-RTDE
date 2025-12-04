@@ -1,164 +1,111 @@
 # tablet_reader.py
-# Cross-platform tablet reader that auto-selects a backend:
-#  - Windows: WinTab/ctypes
-#  - Linux:   evdev
-#
-# Public API:
-#   reader = TabletReader(normalize=True, smooth_alpha=0.12)
-#   reader.start()
-#   x,y,p = reader.read_normalized(timeout=1.0)  # floats in [0,1]
-#   xr,yr,pr = reader.read_raw(timeout=1.0)      # raw backend units
-#   reader.stop()
+# Cross-platform tablet reader.
 
 from __future__ import annotations
 import sys
+import threading
 import time
+import queue
+import traceback
 from typing import Optional, Tuple
 
 # ---- choose backend by platform ----
 if sys.platform.startswith("win"):
     try:
-        from wintab_wrapper import Tablet as _WinTabTablet  # <-- your file exposing Tablet
+        try:
+            from .wintab_wrapper import Tablet as _WinTabTablet, WintabError
+        except ImportError:
+            from wintab_wrapper import Tablet as _WinTabTablet, WintabError
     except ImportError as e:
+        print("CRITICAL ERROR: Could not import wintab_wrapper.")
         raise ImportError(
             "Couldn't import wintab_wrapper.Tablet. "
-            "Place your Windows backend in 'wintab_wrapper.py' (exports Tablet), "
-            "or adjust the import here."
-        )
+            "Ensure 'wintab_wrapper.py' is in the same folder."
+        ) from e
 
 
     class _Backend:
         def __init__(self, normalize: bool = True, smooth_alpha: Optional[float] = 0.12, **_):
-            # WinTab Tablet already exposes normalized & raw readers
+            print("[Backend] Initializing WintabTablet...")
             self._t = _WinTabTablet(smooth_alpha=smooth_alpha)
             self._normalize = normalize
 
-        def start(self): self._t.start()
-        def stop(self): self._t.stop()
+        def start(self, wait_ready: bool = True, timeout: float = 3.0):
+            print("[Backend] Starting WintabTablet...")
+            self._t.start(wait_ready=wait_ready, timeout=timeout)
+
+        def stop(self):
+            print("[Backend] Stopping WintabTablet...")
+            self._t.stop()
 
         def read_normalized(self, timeout: Optional[float]) -> Tuple[float, float, float]:
-            # (x,y,p) in [0,1]
-            return self._t.read_normalized(timeout=timeout)
+            try:
+                return self._t.read_normalized(timeout=timeout)
+            except (WintabError, queue.Empty):
+                # Return None tuple to signal Timeout in Reader
+                return (None, None, None)
 
         def read_raw(self, timeout: Optional[float]) -> Tuple[int, int, int]:
-            # raw integer device space
-            return self._t.read(timeout=timeout)
-
-elif sys.platform.startswith("linux"):
-    try:
-        from linux_wacom_evdev import WacomTabletReader as _EvdevTablet
-    except ImportError as e:
-        raise ImportError(
-            "Couldn't import linux_wacom_evdev.WacomTabletReader. "
-            "Place your Linux backend in 'linux_wacom_evdev.py' (exports WacomTabletReader), "
-            "or adjust the import here."
-        )
-    class _Backend:
-        def __init__(self,
-                     normalize: bool = True,
-                     smooth_alpha: Optional[float] = 0.15,
-                     device_path: Optional[str] = None,
-                     require_wacom_name: bool = False,
-                     **_):
-            # The evdev backend can emit normalized or raw depending on ctor flag
-            self._normalize = normalize
-            self._t = _EvdevTablet(
-                device_path=device_path,
-                normalize=normalize,
-                smooth_alpha=smooth_alpha,
-                require_wacom_name=require_wacom_name,
-            )
-            self._last: Tuple[Optional[float], Optional[float], Optional[float]] = (None, None, None)
-
-        def start(self): self._t.start()
-        def stop(self): self._t.stop()
-
-        def _read_with_timeout(self, timeout: Optional[float]):
-            deadline = (time.time() + timeout) if timeout else None
-            while True:
-                x, y, p = self._t.read()
-                if x is not None and y is not None and p is not None:
-                    return x, y, p
-                if deadline is not None and time.time() >= deadline:
-                    return x, y, p  # may be None if nothing arrived yet
-                time.sleep(0.005)
-
-        def read_normalized(self, timeout: Optional[float]) -> Tuple[float, float, float]:
-            # If constructed with normalize=True (default), values are already 0..1
-            x, y, p = self._read_with_timeout(timeout)
-            return x, y, p  # either floats 0..1 or raw if normalize=False
-
-        def read_raw(self, timeout: Optional[float]):
-            # Only guaranteed "raw" if the backend was created with normalize=False
-            if self._normalize:
-                raise RuntimeError(
-                    "Linux backend is in normalize=True mode. "
-                    "Construct TabletReader(normalize=False) to get raw values."
-                )
-            return self._read_with_timeout(timeout)
-
+            try:
+                return self._t.read(timeout=timeout)
+            except (WintabError, queue.Empty):
+                return (None, None, None)
 else:
     raise RuntimeError(f"Unsupported OS: {sys.platform}")
 
 
 class TabletReader:
-    """
-    Cross-platform tablet reader with a unified API.
+    def __init__(self, normalize: bool = True, smooth_alpha: Optional[float] = 0.12, **kwargs):
+        self._backend = _Backend(normalize=normalize, smooth_alpha=smooth_alpha, **kwargs)
 
-    Args:
-      normalize: if True, returns x,y,p in [0,1]. If False, returns backend raw units.
-      smooth_alpha: EMA smoothing factor (backend dependent; 0..1; None disables)
-      device_path (Linux): override /dev/input/eventX
-      require_wacom_name (Linux): only match devices with 'wacom' in their name
+    def start(self):
+        self._backend.start()
 
-    Methods:
-      start(), stop()
-      read_normalized(timeout=None) -> (x,y,p) floats in [0,1]
-      read_raw(timeout=None)        -> raw backend units
-    """
-    def __init__(self,
-                 normalize: bool = True,
-                 smooth_alpha: Optional[float] = 0.12,
-                 device_path: Optional[str] = None,
-                 require_wacom_name: bool = False):
-        self._backend = _Backend(
-            normalize=normalize,
-            smooth_alpha=smooth_alpha,
-            device_path=device_path,
-            require_wacom_name=require_wacom_name,
-        )
-        self._normalize = normalize
-
-    def start(self): self._backend.start()
-    def stop(self): self._backend.stop()
+    def stop(self):
+        self._backend.stop()
 
     def read_normalized(self, timeout: Optional[float] = None):
-        """Always returns (x,y,p) in [0,1]; on Linux this requires normalize=True at construction."""
         vals = self._backend.read_normalized(timeout)
-        if vals[0] is None:
-            raise TimeoutError("No tablet data available yet (normalized). Try increasing timeout or ensure pen is in proximity.")
-        # Windows: guaranteed 0..1. Linux: 0..1 if normalize=True; else raw (documented).
+        if vals is None or vals[0] is None:
+            raise TimeoutError("No tablet data (pen likely away)")
         return vals
 
     def read_raw(self, timeout: Optional[float] = None):
-        """Returns raw device units; on Linux this requires normalize=False at construction."""
         vals = self._backend.read_raw(timeout)
-        if vals[0] is None:
-            raise TimeoutError("No tablet data available yet (raw). Try increasing timeout or ensure pen is in proximity.")
+        if vals is None or vals[0] is None:
+            raise TimeoutError("No tablet data (pen likely away)")
         return vals
 
 
 # -------------- example --------------
 if __name__ == "__main__":
-    # Normalized control (recommended for robot mapping)
     reader = TabletReader(normalize=True, smooth_alpha=0.12)
-    reader.start()
+    print("Starting tablet listener...")
     try:
+        reader.start()
+        print("Tablet started. Bring pen close (Ctrl+C to stop)...")
+
         while True:
-            x, y, p = reader.read_normalized(timeout=2.0)
-            print(f"x={x:.3f}  y={y:.3f}  p={p:.3f}")
-            time.sleep(0.01)
+            try:
+                # Set a small timeout for responsiveness
+                x, y, p = reader.read_normalized(timeout=0.1)
+
+                status = "Active " if p > 0 else "Hover  "
+                print(f"[{status}] x={x:.3f}  y={y:.3f}  p={p:.3f}")
+
+            except TimeoutError:
+                # Print a dot so you know the script hasn't crashed
+                sys.stdout.write(".")
+                sys.stdout.flush()
+
+            except Exception as e:
+                pass  # Ignore loops errors
+
     except KeyboardInterrupt:
-        pass
+        print("\nStopping...")
+    except Exception as e:
+        print(f"\n[Fatal Error]: {e}")
+        traceback.print_exc()
     finally:
         reader.stop()
+        print("Done.")

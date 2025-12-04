@@ -5,3 +5,4 @@ PyQt6==6.9.1
 setuptools==80.9.0
 wheel==0.45.1
 windows_curses==2.4.1; platform_system == "Windows"
+-e ./RTDE_Python_Client_Library

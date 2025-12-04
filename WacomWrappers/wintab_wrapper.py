@@ -1,26 +1,50 @@
-# Windows-only Wintab (Wacom) minimal wrapper using ctypes
-# Focus: expose simple Tablet class to get raw and normalized (x,y,pressure)
+# wintab_wrapper.py
+# Windows-only Wintab (Wacom) wrapper using ctypes and Queues
 
 from __future__ import annotations
 
 import ctypes
 import threading
-import time
+import queue
+import traceback
+import sys
 from typing import Optional, Tuple
 from ctypes import wintypes
 
-# ---------- Win32 & helpers ----------
-HINSTANCE = wintypes.HMODULE
-HICON = wintypes.HANDLE
-HCURSOR = wintypes.HANDLE
-HBRUSH = wintypes.HANDLE
-HMENU = wintypes.HANDLE
+# --- DEBUG CONFIG ---
+DEBUG = False
+
+
+def log(msg):
+    if DEBUG:
+        print(f"[Wintab] {msg}")
+        sys.stdout.flush()
+
+
+# ---------- Win32 Types & Helpers ----------
+if ctypes.sizeof(ctypes.c_void_p) == 8:
+    LPARAM = ctypes.c_int64
+    WPARAM = ctypes.c_uint64
+else:
+    LPARAM = ctypes.c_long
+    WPARAM = ctypes.c_uint
+
+HANDLE = ctypes.c_void_p
+HWND = HANDLE
+HINSTANCE = HANDLE
+HICON = HANDLE
+HCURSOR = HANDLE
+HBRUSH = HANDLE
+HMENU = HANDLE
+
 
 class WintabError(RuntimeError):
     pass
 
+
 # ----- Wintab structs / constants -----
-FIX32 = wintypes.LONG  # 16.16 fixed, not converted here
+FIX32 = wintypes.LONG
+
 
 class AXIS(ctypes.Structure):
     _fields_ = [
@@ -29,6 +53,7 @@ class AXIS(ctypes.Structure):
         ("axUnits", wintypes.UINT),
         ("axResolution", FIX32),
     ]
+
 
 class LOGCONTEXTA(ctypes.Structure):
     _fields_ = [
@@ -68,60 +93,65 @@ class LOGCONTEXTA(ctypes.Structure):
         ("lcSysSensY", ctypes.c_int),
     ]
 
-# Our packet layout must match the requested PK_* order used by pktdef.h.
-# For (X, Y, NormalPressure) this ordering is correct on standard Wintab.
-class PACKET_XY_PRESS(ctypes.Structure):
-    _fields_ = [
-        ("pkX", wintypes.LONG),
-        ("pkY", wintypes.LONG),
-        ("pkNormalPressure", wintypes.UINT),
-    ]
 
-# Packet data bits (subset)
-PK_X                = 0x0080
-PK_Y                = 0x0100
-PK_NORMAL_PRESSURE  = 0x0400
+# Packet data bits
+PK_CONTEXT = 0x0001
+PK_STATUS = 0x0002
+PK_TIME = 0x0004
+PK_CHANGED = 0x0008
+PK_SERIAL = 0x0010
+PK_CURSOR = 0x0020
+PK_BUTTONS = 0x0040
+PK_X = 0x0080
+PK_Y = 0x0100
+PK_Z = 0x0200
+PK_NORMAL_PRESSURE = 0x0400
+PK_TANGENT_PRESSURE = 0x0800
+PK_ORIENTATION = 0x1000
+PK_ROTATION = 0x2000
 
 # Context options
-CXO_SYSTEM   = 0x0001
-CXO_PEN      = 0x0002
+CXO_SYSTEM = 0x0001
+CXO_PEN = 0x0002
 CXO_MESSAGES = 0x0004
+CXO_MARGIN = 0x8000
 
-# WTInfo categories and indices (subset)
 WTI_DEFCONTEXT = 3
-WTI_DEVICES    = 100
+WTI_DEVICES = 100
+DVC_X = 12
+DVC_Y = 13
+DVC_NPRESSURE = 15
 
-# Device axis indices (commonly defined in pktdef.h)
-DVC_X           = 0
-DVC_Y           = 1
-DVC_Z           = 2
-DVC_NPRESSURE   = 24   # normal pressure axis
-# (Tilt/orientation etc. have other indices; we only use these three.)
+WT_DEFBASE = 0x7FF0
+WT_PACKET = WT_DEFBASE + 0
+WM_DESTROY = 0x0002
+WM_CLOSE = 0x0010
+WM_NULL = 0x0000
 
-# Messages and window flags
-WT_DEFBASE  = 0x7FF0
-WT_PACKET   = WT_DEFBASE + 0
-WM_DESTROY  = 0x0002
-WM_CLOSE    = 0x0010
-CS_VREDRAW  = 0x0001
-CS_HREDRAW  = 0x0002
-WS_OVERLAPPED   = 0x00000000
-WS_EX_NOACTIVATE= 0x08000000
+CS_VREDRAW = 0x0001
+CS_HREDRAW = 0x0002
+WS_OVERLAPPED = 0x00000000
+WS_EX_NOACTIVATE = 0x08000000
 
 # ---------- DLLs ----------
-_user32   = ctypes.WinDLL("user32", use_last_error=True)
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+
 def _load_wintab() -> ctypes.WinDLL:
+    log("Loading Wintab32.dll...")
     try:
-        return ctypes.WinDLL("Wintab32.dll")
+        dll = ctypes.WinDLL("Wintab32.dll")
+        log(f"Wintab32.dll loaded at {dll}")
+        return dll
     except OSError as e:
-        raise WintabError(
-            "Wintab32.dll not found. Install/enable the Wacom/WinTab driver (or disable Windows Ink for this app)."
-        ) from e
+        log("FAILED to load Wintab32.dll")
+        raise WintabError("Wintab32.dll not found. Is the tablet driver installed?") from e
+
 
 # ---------- Win32 window plumbing ----------
-WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_int64, HWND, wintypes.UINT, WPARAM, LPARAM)
+
 
 class WNDCLASSW(ctypes.Structure):
     _fields_ = [
@@ -137,50 +167,38 @@ class WNDCLASSW(ctypes.Structure):
         ("lpszClassName", wintypes.LPCWSTR),
     ]
 
+
 class MSG(ctypes.Structure):
     _fields_ = [
-        ("hwnd", wintypes.HWND),
+        ("hwnd", HWND),
         ("message", wintypes.UINT),
-        ("wParam", wintypes.WPARAM),
-        ("lParam", wintypes.LPARAM),
+        ("wParam", WPARAM),
+        ("lParam", LPARAM),
         ("time", wintypes.DWORD),
         ("pt_x", ctypes.c_long),
         ("pt_y", ctypes.c_long),
     ]
 
+
 _user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
-_user32.RegisterClassW.restype  = wintypes.ATOM
+_user32.RegisterClassW.restype = wintypes.ATOM
 _user32.CreateWindowExW.argtypes = [
     wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-    wintypes.HWND, HMENU, HINSTANCE, wintypes.LPVOID
+    HWND, HMENU, HINSTANCE, ctypes.c_void_p
 ]
-_user32.CreateWindowExW.restype  = wintypes.HWND
-_user32.DefWindowProcW.argtypes  = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-_user32.DefWindowProcW.restype   = ctypes.c_long
-_user32.DestroyWindow.argtypes   = [wintypes.HWND]
-_user32.DestroyWindow.restype    = wintypes.BOOL
-_user32.GetMessageW.argtypes     = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
-_user32.GetMessageW.restype      = wintypes.BOOL
-_user32.TranslateMessage.argtypes= [ctypes.POINTER(MSG)]
-_user32.DispatchMessageW.argtypes= [ctypes.POINTER(MSG)]
-_user32.PostQuitMessage.argtypes = [ctypes.c_int]
-_user32.PostMessageW.argtypes    = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-_kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
-_kernel32.GetModuleHandleW.restype  = wintypes.HMODULE
+_user32.CreateWindowExW.restype = HWND
+_user32.PostMessageW.argtypes = [HWND, wintypes.UINT, WPARAM, LPARAM]
+_user32.PostMessageW.restype = wintypes.BOOL
+_user32.DefWindowProcW.argtypes = [HWND, wintypes.UINT, WPARAM, LPARAM]
+_user32.DefWindowProcW.restype = ctypes.c_int64
 
-_instances = {}           # hwnd -> Tablet
+_instances = {}
 _global_wndproc_ref = None
+
 
 # ---------- Tablet wrapper ----------
 class Tablet:
-    """
-    Headless WinTab reader.
-    Methods:
-      - start()/stop()
-      - read() -> raw ints (x, y, p)
-      - read_normalized() -> floats in [0,1]
-    """
     def __init__(self, smooth_alpha: Optional[float] = 0.12):
         self._wt: Optional[ctypes.WinDLL] = None
         self._hctx = None
@@ -188,27 +206,33 @@ class Tablet:
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
         self._stop = threading.Event()
-        self._latest_lock = threading.Lock()
-        self._latest_raw: Optional[Tuple[int, int, int]] = None
+        self._queue = queue.Queue(maxsize=50)
+
         self._x_axis = AXIS()
         self._y_axis = AXIS()
         self._p_axis = AXIS()
         self._smooth_alpha = smooth_alpha
-        self._nx = self._ny = self._np = None  # smoothed normalized
+        self._nx = self._ny = self._np = None
 
-    # --- public API ---
+        self._off_x = -1
+        self._off_y = -1
+        self._off_p = -1
+
     def start(self, wait_ready: bool = True, timeout: float = 3.0):
         if self._thread and self._thread.is_alive():
             return
         self._thread = threading.Thread(target=self._thread_main, name="WintabThread", daemon=True)
         self._thread.start()
-        if wait_ready and not self._ready.wait(timeout):
-            raise WintabError("Timed out starting Wintab thread")
+        if wait_ready:
+            if not self._ready.wait(timeout):
+                raise WintabError("Timed out starting Wintab thread")
+            if self._hctx is None:
+                raise WintabError("Failed to open Wintab context.")
 
     def stop(self):
         self._stop.set()
         if self._hwnd:
-            _user32.PostMessageW(self._hwnd, WM_CLOSE, 0, 0)
+            _user32.PostMessageW(self._hwnd, WM_NULL, 0, 0)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
         self._thread = None
@@ -216,27 +240,19 @@ class Tablet:
         self._hwnd = None
         self._hctx = None
 
-    def __enter__(self): self.start(); return self
-    def __exit__(self, *_): self.stop()
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop()
 
     def read(self, timeout: Optional[float] = None) -> Tuple[int, int, int]:
-        """Raw integers from the device coordinate space."""
         if self._hctx is None:
             raise WintabError("Tablet context not available")
-        if timeout:
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                with self._latest_lock:
-                    if self._latest_raw is not None:
-                        return self._latest_raw
-                time.sleep(0.01)
-        with self._latest_lock:
-            if self._latest_raw is None:
-                raise WintabError("No tablet data yet")
-            return self._latest_raw
+        return self._queue.get(block=True, timeout=timeout)
 
     def read_normalized(self, timeout: Optional[float] = None) -> Tuple[float, float, float]:
-        """(x,y,p) normalized to [0,1] with optional EMA smoothing."""
         rx, ry, rp = self.read(timeout)
         x = self._norm(self._x_axis, rx)
         y = self._norm(self._y_axis, ry)
@@ -255,26 +271,42 @@ class Tablet:
             self._bind()
             self._register_wc()
             self._create_hwnd()
+
+            # 1. Query device axes FIRST to get max coords
+            self._query_axes()
+            log(f"Tablet Ranges - X: 0-{self._x_axis.axMax}, Y: 0-{self._y_axis.axMax}, Press: 0-{self._p_axis.axMax}")
+
+            # 2. Open context with those coords
             ok_ctx = self._open_ctx()
             if ok_ctx:
-                self._query_axes()  # <-- ranges for normalization
+                self._validate_context()
+                log("Context validated.")
+
             self._ready.set()
+
             if ok_ctx:
                 self._msg_loop()
+        except Exception as e:
+            print(f"Internal Wintab Error: {e}")
+            traceback.print_exc()
         finally:
             self._close_ctx()
             self._destroy_hwnd()
 
     def _bind(self):
         wt = self._wt
-        wt.WTInfoA.argtypes  = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p]
-        wt.WTInfoA.restype   = wintypes.UINT
-        wt.WTOpenA.argtypes  = [wintypes.HWND, ctypes.POINTER(LOGCONTEXTA), wintypes.BOOL]
-        wt.WTOpenA.restype   = ctypes.c_void_p  # HCTX
-        wt.WTClose.argtypes  = [ctypes.c_void_p]
-        wt.WTClose.restype   = wintypes.BOOL
-        wt.WTPacket.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p]
-        wt.WTPacket.restype  = wintypes.BOOL
+        wt.WTInfoA.argtypes = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p]
+        wt.WTInfoA.restype = wintypes.UINT
+        wt.WTOpenA.argtypes = [HWND, ctypes.POINTER(LOGCONTEXTA), wintypes.BOOL]
+        wt.WTOpenA.restype = ctypes.c_void_p
+        wt.WTClose.argtypes = [ctypes.c_void_p]
+        wt.WTPacket.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p]
+        wt.WTPacket.restype = wintypes.BOOL
+        try:
+            wt.WTGetA.argtypes = [ctypes.c_void_p, ctypes.POINTER(LOGCONTEXTA)]
+            wt.WTGetA.restype = wintypes.BOOL
+        except AttributeError:
+            log("Warning: WTGetA not found in DLL.")
 
     def _register_wc(self):
         global _global_wndproc_ref
@@ -294,32 +326,91 @@ class Tablet:
             WS_OVERLAPPED, 0, 0, 0, 0, None, None, hInstance, None
         )
         if not hwnd:
-            raise WintabError("Failed to create hidden window")
+            raise WintabError(f"CreateWindow failed: {ctypes.WinError()}")
         self._hwnd = hwnd
         _instances[hwnd] = self
 
     def _destroy_hwnd(self):
-        hwnd = self._hwnd
-        if hwnd:
-            _instances.pop(hwnd, None)
-            _user32.DestroyWindow(hwnd)
+        if self._hwnd:
+            _instances.pop(self._hwnd, None)
+            _user32.DestroyWindow(self._hwnd)
             self._hwnd = None
 
     def _open_ctx(self) -> bool:
         wt = self._wt
         lc = LOGCONTEXTA()
+
+        # Get defaults
         if wt.WTInfoA(WTI_DEFCONTEXT, 0, ctypes.byref(lc)) == 0:
-            return False  # no tablet/driver
+            return False
+
+        if self._x_axis.axMax > 0:
+            lc.lcInOrgX = 0
+            lc.lcInExtX = self._x_axis.axMax
+            lc.lcOutOrgX = 0
+            lc.lcOutExtX = self._x_axis.axMax  # 1:1 mapping
+
+        if self._y_axis.axMax > 0:
+            lc.lcInOrgY = 0
+            lc.lcInExtY = self._y_axis.axMax
+            lc.lcOutOrgY = 0
+            lc.lcOutExtY = self._y_axis.axMax  # 1:1 mapping
+
+        if self._p_axis.axMax > 0:
+            lc.lcOutExtZ = self._p_axis.axMax  # Using Z slot for pressure scaling often helps
+
         lc.lcPktData = PK_X | PK_Y | PK_NORMAL_PRESSURE
-        lc.lcMoveMask = lc.lcPktData
-        lc.lcPktMode = 0
-        lc.lcOptions |= CXO_MESSAGES  # receive WT_PACKET messages
-        lc.lcMsgBase = WT_DEFBASE
+        lc.lcMoveMask = PK_X | PK_Y | PK_NORMAL_PRESSURE
+        lc.lcPktMode = 0  # Absolute mode
+
+        # Ensure we catch messages
+        lc.lcOptions |= CXO_MESSAGES
+        lc.lcOptions |= CXO_MARGIN
+
+        # We strip CXO_SYSTEM to ensure we are getting raw digitizer data,
+        # not system cursor coordinates which might be clipped.
+        lc.lcOptions &= ~CXO_SYSTEM
+
         hctx = wt.WTOpenA(self._hwnd, ctypes.byref(lc), True)
         if not hctx:
             return False
+
         self._hctx = hctx
         return True
+
+    def _validate_context(self):
+        lc = LOGCONTEXTA()
+        if hasattr(self._wt, 'WTGetA'):
+            self._wt.WTGetA(self._hctx, ctypes.byref(lc))
+            pkt_mask = lc.lcPktData
+            log(f"Active Context PktData: {hex(pkt_mask)}")
+        else:
+            pkt_mask = PK_X | PK_Y | PK_NORMAL_PRESSURE
+
+        current_offset = 0
+
+        def check_field(mask, flag, size=4):
+            nonlocal current_offset
+            offset = -1
+            if mask & flag:
+                offset = current_offset
+                current_offset += size
+            return offset
+
+        check_field(pkt_mask, PK_CONTEXT)
+        check_field(pkt_mask, PK_STATUS)
+        check_field(pkt_mask, PK_TIME)
+        check_field(pkt_mask, PK_CHANGED)
+        check_field(pkt_mask, PK_SERIAL)
+        check_field(pkt_mask, PK_CURSOR)
+        check_field(pkt_mask, PK_BUTTONS)
+
+        self._off_x = check_field(pkt_mask, PK_X)
+        self._off_y = check_field(pkt_mask, PK_Y)
+        self._off_z = check_field(pkt_mask, PK_Z)
+        self._off_p = check_field(pkt_mask, PK_NORMAL_PRESSURE)
+
+        log(f"Offsets: X={self._off_x}, Y={self._off_y}, P={self._off_p}. Total packet size ~{current_offset}")
 
     def _close_ctx(self):
         if self._wt and self._hctx:
@@ -327,69 +418,76 @@ class Tablet:
             self._hctx = None
 
     def _query_axes(self):
-        # Fill axis ranges for normalization
+        # Queries the dimensions of the tablet hardware (Max X, Max Y, Max Pressure)
         self._wt.WTInfoA(WTI_DEVICES, DVC_X, ctypes.byref(self._x_axis))
         self._wt.WTInfoA(WTI_DEVICES, DVC_Y, ctypes.byref(self._y_axis))
         self._wt.WTInfoA(WTI_DEVICES, DVC_NPRESSURE, ctypes.byref(self._p_axis))
+
+    def _handle_msg(self, hwnd, msg, wParam, lParam):
+        if self._stop.is_set():
+            return _user32.DefWindowProcW(hwnd, msg, wParam, lParam)
+
+        if msg == WT_PACKET and self._wt and self._hctx:
+            serial = int(wParam)
+            hctx_arg = ctypes.c_void_p(lParam)
+
+            buf = (ctypes.c_byte * 128)()
+
+            if self._wt.WTPacket(hctx_arg, serial, ctypes.byref(buf)):
+                x, y, p = 0, 0, 0
+
+                def read_long(offset):
+                    return int.from_bytes(buf[offset:offset + 4], byteorder='little', signed=True)
+
+                def read_uint(offset):
+                    return int.from_bytes(buf[offset:offset + 4], byteorder='little', signed=False)
+
+                if self._off_x >= 0: x = read_long(self._off_x)
+                if self._off_y >= 0: y = read_long(self._off_y)
+                if self._off_p >= 0: p = read_uint(self._off_p)
+
+                raw_data = (x, y, p)
+
+                try:
+                    self._queue.put_nowait(raw_data)
+                except queue.Full:
+                    try:
+                        self._queue.get_nowait()
+                        self._queue.put_nowait(raw_data)
+                    except (queue.Empty, queue.Full):
+                        pass
+            return 0
+
+        return _user32.DefWindowProcW(hwnd, msg, wParam, lParam)
 
     def _msg_loop(self):
         msg = MSG()
         while not self._stop.is_set():
             res = _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if res == 0:   # WM_QUIT
-                break
-            if res == -1:  # error
-                break
+            if res <= 0: break
+            if self._stop.is_set(): break
             _user32.TranslateMessage(ctypes.byref(msg))
             _user32.DispatchMessageW(ctypes.byref(msg))
 
-    def _handle_msg(self, hwnd, msg, wParam, lParam):
-        if msg == WT_PACKET and self._wt and self._hctx:
-            pkt = PACKET_XY_PRESS()
-            # WT_PACKET: wParam=pkt serial, lParam=HCTX
-            ok = self._wt.WTPacket(ctypes.c_void_p(lParam), wParam, ctypes.byref(pkt))
-            if ok:
-                with self._latest_lock:
-                    self._latest_raw = (int(pkt.pkX), int(pkt.pkY), int(pkt.pkNormalPressure))
-                return 0
-        elif msg == WM_CLOSE:
-            _user32.DestroyWindow(hwnd); return 0
-        elif msg == WM_DESTROY:
-            _user32.PostQuitMessage(0); return 0
-        return _user32.DefWindowProcW(hwnd, msg, wParam, lParam)
-
-    # --- math helpers ---
     @staticmethod
     def _norm(axis: AXIS, v: int) -> float:
         lo, hi = int(axis.axMin), int(axis.axMax)
-        if hi == lo:
-            return 0.0
+        if hi == lo: return 0.0
         f = (v - lo) / float(hi - lo)
-        return 0.0 if f < 0 else 1.0 if f > 1 else f
+        return max(0.0, min(1.0, f))
 
     def _ema(self, prev, new):
-        if new is None: return prev
-        if prev is None: return new
+        if new is None or prev is None: return new
         a = float(self._smooth_alpha)
         return (1 - a) * prev + a * new
 
 
-# Global wndproc: dispatch to instance
 @WNDPROC
 def _global_wndproc(hwnd, msg, wParam, lParam):
-    inst = _instances.get(hwnd)
-    if inst is not None:
-        return inst._handle_msg(hwnd, msg, wParam, lParam)
+    try:
+        inst = _instances.get(hwnd)
+        if inst:
+            return inst._handle_msg(hwnd, msg, wParam, lParam)
+    except Exception:
+        pass
     return _user32.DefWindowProcW(hwnd, msg, wParam, lParam)
-
-
-# --------- Example ----------
-if __name__ == "__main__":
-    with Tablet(smooth_alpha=0.12) as t:
-        while True:
-            try:
-                x, y, p = t.read_normalized(timeout=2.0)
-                print(f"x={x:.3f}  y={y:.3f}  p={p:.3f}")
-                time.sleep(0.01)
-            except KeyboardInterrupt:
-                break
